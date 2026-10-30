@@ -35,6 +35,15 @@ namespace ArcGisMcpAddin
         /// <summary>Sentinel file the execute_code toolbox polls for cancellation.</summary>
         public string? CancelFile { get; set; }
 
+        /// <summary>
+        /// False for execute_code: cancelling the GP token there stopped the
+        /// toolbox's own sentinel-file cancel from working (tested on Pro 3.7.3),
+        /// so that job is cancelled through the sentinel file only.
+        /// </summary>
+        public bool CancelViaToken { get; set; } = true;
+
+        public bool CancelRequested { get; set; }
+
         /// <summary>File execute_code tees stdout into, read for progress.</summary>
         public string? OutputFile { get; set; }
 
@@ -73,7 +82,7 @@ namespace ArcGisMcpAddin
                 elapsed_s = Math.Round((DateTime.UtcNow - StartedUtc).TotalSeconds, 1),
                 percent,
                 last_message = string.IsNullOrEmpty(lastOutput) ? message : lastOutput,
-                cancel_requested = Cts.IsCancellationRequested
+                cancel_requested = CancelRequested
             };
         }
 
@@ -152,10 +161,14 @@ namespace ArcGisMcpAddin
                     return new { cancelled = false, message = $"Job '{jobId}' is not running. The running job is '{job.Id}'." };
                 }
 
-                job.Cts.Cancel();
+                job.CancelRequested = true;
                 if (!string.IsNullOrEmpty(job.CancelFile))
                 {
                     File.WriteAllText(job.CancelFile, "cancel");
+                }
+                if (job.CancelViaToken)
+                {
+                    job.Cts.Cancel();
                 }
 
                 return new { cancelled = true, job_id = job.Id, message = "Cancel requested. The job stops at its next checkpoint." };

@@ -37,6 +37,7 @@ namespace ArcGisMcpAddin.Commands
                 string resultPath = Path.Combine(jobDir, "result.json");
                 string stdoutPath = Path.Combine(jobDir, "stdout.txt");
                 job.CancelFile = Path.Combine(jobDir, "cancel");
+                job.CancelViaToken = false;
                 job.OutputFile = stdoutPath;
                 File.WriteAllText(codePath, code, Utf8NoBom);
 
@@ -66,8 +67,8 @@ namespace ArcGisMcpAddin.Commands
                     {
                         job_id = job.Id,
                         ok = false,
-                        cancelled = job.Cts.IsCancellationRequested,
-                        error = job.Cts.IsCancellationRequested
+                        cancelled = job.CancelRequested,
+                        error = job.CancelRequested
                             ? "Cancelled before the code finished."
                             : "The ExecuteCode tool did not produce a result.",
                         gp_messages = gpMessages
