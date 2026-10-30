@@ -60,6 +60,7 @@
     <None Remove="Images\**" />
     <Content Include="Config.daml" />
     <Content Include="Images\**" />
+    <EmbeddedResource Include="Toolbox\ArcProMcp.pyt" LogicalName="ArcGisMcpAddin.Toolbox.ArcProMcp.pyt" />
   </ItemGroup>
 
   <Import Project="C:\Program Files\ArcGIS\Pro\bin\Esri.ProApp.SDK.Desktop.targets" />

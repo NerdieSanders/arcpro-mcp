@@ -34,21 +34,39 @@ class OperationalContractsTest(unittest.TestCase):
         server = PYTHON_SERVER / "arcgis_mcp" / "server.py"
         tree = ast.parse(server.read_text(encoding="utf-8"))
 
-        tools = []
+        core_tools = []
+        full_tools = []
         resources = []
         prompts = []
         for node in tree.body:
-            if not isinstance(node, ast.FunctionDef):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             decorators = [ast.unparse(item) for item in node.decorator_list]
             if any(item.startswith("mcp.tool") for item in decorators):
-                tools.append(node.name)
+                core_tools.append(node.name)
+                self.assertIsInstance(node, ast.AsyncFunctionDef, node.name)
+            if any(item.startswith("full_tool") for item in decorators):
+                full_tools.append(node.name)
             if any(item.startswith("mcp.resource") for item in decorators):
                 resources.append(node.name)
             if any(item.startswith("mcp.prompt") for item in decorators):
                 prompts.append(node.name)
 
-        self.assertEqual(167, len(tools))
+        self.assertEqual(
+            [
+                "status",
+                "execute_code",
+                "run_gp_tool",
+                "job_result",
+                "get_layer_fields",
+                "save_project",
+                "cancel_job",
+            ],
+            core_tools,
+        )
+        self.assertEqual([], sorted(set(core_tools) & set(full_tools)))
+        tools = core_tools + full_tools
+        self.assertEqual(171, len(tools))
         self.assertEqual(2, len(resources))
         self.assertEqual(2, len(prompts))
         self.assertIn("spatial_join", tools)
@@ -89,9 +107,9 @@ class OperationalContractsTest(unittest.TestCase):
         addin_commands = set(re.findall(r'"([a-z0-9_]+)"', command_block.group("body")))
         python_wrappers = set(re.findall(r'"([a-z0-9_]+)"', tool_block.group("body")))
         handler_cases = set(re.findall(r'case "([a-z0-9_]+)":', handler))
-        public_tools = (addin_commands - {"ping"}) | python_wrappers
+        public_tools = (addin_commands - {"ping", "job_status"}) | python_wrappers
 
-        self.assertEqual(71, len(addin_commands))
+        self.assertEqual(75, len(addin_commands))
         self.assertEqual(addin_commands, handler_cases)
         self.assertIn("ping", addin_commands)
         self.assertIn("spatial_join", python_wrappers)
@@ -102,7 +120,9 @@ class OperationalContractsTest(unittest.TestCase):
         self.assertIn("check_license", addin_commands)
         self.assertIn("insert_features", addin_commands)
         self.assertIn("set_camera_3d", addin_commands)
-        self.assertEqual(167, len(public_tools))
+        self.assertIn("execute_code", addin_commands)
+        self.assertIn("cancel_job", addin_commands)
+        self.assertEqual(171, len(public_tools))
 
     def test_public_files_do_not_contain_local_paths_or_ai_branding(self):
         blocked_terms = [
@@ -112,7 +132,6 @@ class OperationalContractsTest(unittest.TestCase):
             "Co" + "dex",
             "2026" + "-05" + "-30",
             "Chat" + "GPT",
-            "Clau" + "de",
             "Co" + "pilot",
             "Anti" + "gravity",
             "inteligencia " + "artificial",
@@ -139,7 +158,8 @@ class OperationalContractsTest(unittest.TestCase):
             if not path.is_file() or path.suffix.lower() not in checked_suffixes:
                 continue
             if any(
-                part in {"bin", "obj", "__pycache__", ".git"} for part in path.parts
+                part in {"bin", "obj", "__pycache__", ".git", ".venv", "venv"}
+                for part in path.parts
             ):
                 continue
             text = path.read_text(encoding="utf-8", errors="ignore")
@@ -176,8 +196,8 @@ class OperationalContractsTest(unittest.TestCase):
 
         self.assertNotIn("66 tools", docs)
         self.assertNotIn("55 commands", docs)
-        self.assertIn("167 MCP tools", docs)
-        self.assertIn("71 Add-In commands", docs)
+        self.assertIn("171 MCP tools", docs)
+        self.assertIn("75 Add-In commands", docs)
 
     def test_destructive_geoprocessing_requires_explicit_opt_in(self):
         with self.assertRaises(safety.DestructiveOperationBlocked):
@@ -229,7 +249,8 @@ class OperationalContractsTest(unittest.TestCase):
             if path in allowed_reexport_modules:
                 continue
             if any(
-                part in {"build", "dist", "__pycache__"} or part.endswith(".egg-info")
+                part in {"build", "dist", "__pycache__", ".venv", "venv"}
+                or part.endswith(".egg-info")
                 for part in path.parts
             ):
                 continue

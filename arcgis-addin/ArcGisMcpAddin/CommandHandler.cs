@@ -35,6 +35,26 @@ namespace ArcGisMcpAddin
                         resultData = new { message = "pong", time = DateTime.Now.ToString("o") };
                         break;
 
+                    case "status":
+                        resultData = await StatusCommands.StatusAsync();
+                        break;
+
+                    case "job_status":
+                        resultData = new { running_job = JobManager.Current() };
+                        break;
+
+                    case "cancel_job":
+                        string? cancelJobId = paramsEl.ValueKind == JsonValueKind.Object && paramsEl.TryGetProperty("job_id", out var cjProp) ? cjProp.GetString() : null;
+                        resultData = JobManager.Cancel(cancelJobId);
+                        break;
+
+                    case "execute_code":
+                        string? code = paramsEl.TryGetProperty("code", out var codeProp) ? codeProp.GetString() : null;
+                        if (string.IsNullOrWhiteSpace(code)) throw new ArgumentException("Parameter 'code' is required.");
+                        string? codeJobId = paramsEl.TryGetProperty("job_id", out var cjiProp) ? cjiProp.GetString() : null;
+                        resultData = await ExecuteCodeCommands.ExecuteCodeAsync(code, codeJobId);
+                        break;
+
                     case "health_check":
                         resultData = await CoreCommands.HealthCheckAsync();
                         break;
@@ -316,7 +336,8 @@ namespace ArcGisMcpAddin
                         {
                             gpParams[index++] = item.GetString() ?? "";
                         }
-                        resultData = await GeoprocessingCommands.RunGpToolAsync(gpTool, gpParams, gpAllowDelete, addGpOutputs);
+                        string? gpJobId = paramsEl.TryGetProperty("job_id", out var gpjProp) ? gpjProp.GetString() : null;
+                        resultData = await GeoprocessingCommands.RunGpToolAsync(gpTool, gpParams, gpAllowDelete, addGpOutputs, gpJobId);
                         break;
 
                     // Geodatabase Commands
