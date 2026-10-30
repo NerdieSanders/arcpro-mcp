@@ -2,11 +2,11 @@
 
 `arcpro-mcp` connects ArcGIS Pro 3.7 to MCP clients such as Claude Code. It is a fork of [marcovgonzalezv/arcgis-mcp](https://github.com/marcovgonzalezv/arcgis-mcp) (MIT). An ArcGIS Pro Add-In written in C# runs inside ArcGIS Pro, and a Python FastMCP server exposes it as MCP tools through a local Windows Named Pipe.
 
-By default the server registers 6 core tools. Setting `ARCPRO_MCP_TOOLSET=full` also registers the upstream project's single-purpose tools, for 170 MCP tools in total. The Add-In has 75 Add-In commands. There are 2 MCP resources and 2 prompt templates.
+By default the server registers 7 core tools. Setting `ARCPRO_MCP_TOOLSET=full` also registers the upstream project's single-purpose tools, for 171 MCP tools in total. The Add-In has 75 Add-In commands. There are 2 MCP resources and 2 prompt templates.
 
 ## What this fork changes
 
-- **Small default toolset.** `status`, `execute_code`, `run_gp_tool`, `get_layer_fields`, `save_project`, and `cancel_job`. Every registered tool's description costs context in each session, and `execute_code` covers what the single-purpose tools do.
+- **Small default toolset.** `status`, `execute_code`, `run_gp_tool`, `job_result`, `get_layer_fields`, `save_project`, and `cancel_job`. Every registered tool's description costs context in each session, and `execute_code` covers what the single-purpose tools do.
 - **`execute_code`** runs Python inside Pro through a bundled Python toolbox, so `arcpy.mp.ArcGISProject("CURRENT")` is the open project. Each run gets a fresh namespace, and printed output is returned.
 - **Long jobs don't time out.** `execute_code` and `run_gp_tool` send an MCP progress notification every 5 seconds with the elapsed time, percent done, and the last printed line or geoprocessing message. The response read has no time limit.
 - **Real cancellation.** `cancel_job`, or the client cancelling the request, stops the job in Pro. Geoprocessing tools get a `CancellationToken`. Python code is interrupted between statements through a sentinel file; a single long arcpy call stops only after it returns.
@@ -22,6 +22,19 @@ claude mcp add-json arcpro_mcp '{"type":"stdio","command":"C:/path/to/venv/Scrip
 ```
 
 Use forward slashes in the path.
+
+### Register with the Claude desktop app
+
+The desktop app ends every tool call after about 60 seconds, and progress notifications don't extend that. Set `ARCPRO_MCP_MAX_WAIT_S` below that limit: a long call then returns `"running": true` with a `job_id` while the job keeps running in Pro, and `job_result` waits for it in further calls. In `claude_desktop_config.json` (Settings, Developer, Edit Config), under `mcpServers`:
+
+```json
+"arcpro": {
+  "command": "C:/path/to/venv/Scripts/arcgis-mcp-server.exe",
+  "env": { "ARCPRO_MCP_MAX_WAIT_S": "45" }
+}
+```
+
+Restart the desktop app afterward. Leave `ARCPRO_MCP_MAX_WAIT_S` unset for Claude Code, where calls can run for hours.
 
 ### Build note
 

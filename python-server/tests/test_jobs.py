@@ -82,6 +82,24 @@ class JobsTest(unittest.TestCase):
         self.assertIn("cancel_job", jobs.client.calls)
         self.assertTrue(jobs.client.cancelled.wait(1))
 
+    def test_max_wait_returns_running_then_job_result_finishes(self):
+        jobs.client = FakeClient(run_seconds=0.6)
+
+        async def flow():
+            job_id = jobs._start("execute_code", {"code": "x"})
+            first = await jobs.wait(job_id, None, max_wait=0.2)
+            second = await jobs.wait(job_id, None, max_wait=5)
+            third = await jobs.wait(job_id, None, max_wait=5)
+            return first, second, third
+
+        first, second, third = anyio.run(flow)
+
+        self.assertTrue(first["running"])
+        self.assertEqual("step 2", first["data"]["progress"]["last_message"])
+        self.assertEqual({"ok": True}, second["data"])
+        self.assertEqual("UNKNOWN_JOB", third["error_code"])
+        self.assertNotIn("cancel_job", jobs.client.calls)
+
 
 class RetryTest(unittest.TestCase):
     def test_failure_after_send_is_never_retried(self):

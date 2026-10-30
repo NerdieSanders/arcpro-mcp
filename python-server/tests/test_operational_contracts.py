@@ -57,6 +57,7 @@ class OperationalContractsTest(unittest.TestCase):
                 "status",
                 "execute_code",
                 "run_gp_tool",
+                "job_result",
                 "get_layer_fields",
                 "save_project",
                 "cancel_job",
@@ -65,7 +66,7 @@ class OperationalContractsTest(unittest.TestCase):
         )
         self.assertEqual([], sorted(set(core_tools) & set(full_tools)))
         tools = core_tools + full_tools
-        self.assertEqual(170, len(tools))
+        self.assertEqual(171, len(tools))
         self.assertEqual(2, len(resources))
         self.assertEqual(2, len(prompts))
         self.assertIn("spatial_join", tools)
@@ -121,7 +122,7 @@ class OperationalContractsTest(unittest.TestCase):
         self.assertIn("set_camera_3d", addin_commands)
         self.assertIn("execute_code", addin_commands)
         self.assertIn("cancel_job", addin_commands)
-        self.assertEqual(170, len(public_tools))
+        self.assertEqual(171, len(public_tools))
 
     def test_public_files_do_not_contain_local_paths_or_ai_branding(self):
         blocked_terms = [
@@ -195,7 +196,7 @@ class OperationalContractsTest(unittest.TestCase):
 
         self.assertNotIn("66 tools", docs)
         self.assertNotIn("55 commands", docs)
-        self.assertIn("170 MCP tools", docs)
+        self.assertIn("171 MCP tools", docs)
         self.assertIn("75 Add-In commands", docs)
 
     def test_destructive_geoprocessing_requires_explicit_opt_in(self):

@@ -17,7 +17,8 @@ Controls the running ArcGIS Pro session.
 - Use run_gp_tool for a single long geoprocessing tool: it reports percent
   done and cancels cleanly.
 - One job runs at a time. Long jobs send progress while they run. Use
-  cancel_job to stop one.
+  cancel_job to stop one. If a call returns "running": true, call
+  job_result with its job_id to keep waiting.
 """
 
 # Initialize FastMCP Server
@@ -47,6 +48,35 @@ def _failure(resp: dict) -> str:
             "error": resp.get("message") or resp.get("error"),
         }
     )
+
+
+def _format_job(command: str, resp: dict) -> str:
+    if not resp.get("success"):
+        return _failure(resp)
+    if resp.get("running"):
+        return _dump(resp["data"])
+
+    data = dict(resp.get("data") or {})
+    elapsed_s = round(resp.get("elapsed_ms", 0) / 1000, 1)
+    if command != "execute_code":
+        data["elapsed_s"] = elapsed_s
+        return _dump(data)
+
+    keep = [
+        "job_id",
+        "ok",
+        "cancelled",
+        "error",
+        "traceback",
+        "stdout_truncated",
+        "stdout_path",
+        "code_elapsed_s",
+    ]
+    summary = {k: data.get(k) for k in keep if data.get(k) not in (None, False)}
+    summary["ok"] = bool(data.get("ok"))
+    summary["elapsed_s"] = elapsed_s
+    stdout = data.get("stdout") or ""
+    return _dump(summary) + ("\n--- stdout ---\n" + stdout if stdout else "")
 
 
 # =====================================================================
@@ -84,24 +114,7 @@ async def execute_code(code: str, ctx: Context = None) -> str:
     takes effect between Python statements, not inside one arcpy call.
     """
     resp = await jobs.run_job("execute_code", {"code": code}, ctx)
-    if not resp.get("success"):
-        return _failure(resp)
-    data = resp.get("data") or {}
-    keep = [
-        "job_id",
-        "ok",
-        "cancelled",
-        "error",
-        "traceback",
-        "stdout_truncated",
-        "stdout_path",
-        "code_elapsed_s",
-    ]
-    summary = {k: data.get(k) for k in keep if data.get(k) not in (None, False)}
-    summary["ok"] = bool(data.get("ok"))
-    summary["elapsed_s"] = round(resp.get("elapsed_ms", 0) / 1000, 1)
-    stdout = data.get("stdout") or ""
-    return _dump(summary) + ("\n--- stdout ---\n" + stdout if stdout else "")
+    return _format_job("execute_code", resp)
 
 
 @mcp.tool()
@@ -133,11 +146,17 @@ async def run_gp_tool(
         },
         ctx,
     )
-    if not resp.get("success"):
-        return _failure(resp)
-    data = dict(resp.get("data") or {})
-    data["elapsed_s"] = round(resp.get("elapsed_ms", 0) / 1000, 1)
-    return _dump(data)
+    return _format_job("run_gp_tool", resp)
+
+
+@mcp.tool()
+async def job_result(job_id: str, ctx: Context = None) -> str:
+    """Waits for a job that execute_code or run_gp_tool returned as still
+    running, and returns its result. Only needed where the client limits how
+    long one tool call may last."""
+    command = jobs.job_command(job_id)
+    resp = await jobs.wait(job_id, ctx)
+    return _format_job(command or "", resp)
 
 
 @mcp.tool()

@@ -140,6 +140,7 @@ namespace ArcGisMcpAddin.Commands
             {
                 // Python-only wrappers (delegate to run_gp_tool or to another
                 // Add-In command). These are not Add-In commands themselves.
+                "job_result",
                 "buffer_analysis",
                 "clip_analysis",
                 "connect_portal",
