@@ -23,6 +23,10 @@ claude mcp add-json arcpro_mcp '{"type":"stdio","command":"C:/path/to/venv/Scrip
 
 Use forward slashes in the path.
 
+### Build note
+
+`dotnet build` ends by running `RegisterAddIn.exe` to install the add-in. If that step prints "'RegisterAddIn.exe' is not recognized", the build still succeeded: install `arcgis-addin/ArcGisMcpAddin/bin/Debug/win-x64/ArcGisMcpAddin.esriAddinX` by double-clicking it, or run `"C:/Program Files/ArcGIS/Pro/bin/RegisterAddIn.exe" <path to .esriAddinX> /s`. Restart ArcGIS Pro to load it.
+
 ---
 
 ## Overview

@@ -157,7 +157,8 @@ class OperationalContractsTest(unittest.TestCase):
             if not path.is_file() or path.suffix.lower() not in checked_suffixes:
                 continue
             if any(
-                part in {"bin", "obj", "__pycache__", ".git"} for part in path.parts
+                part in {"bin", "obj", "__pycache__", ".git", ".venv", "venv"}
+                for part in path.parts
             ):
                 continue
             text = path.read_text(encoding="utf-8", errors="ignore")
@@ -247,7 +248,8 @@ class OperationalContractsTest(unittest.TestCase):
             if path in allowed_reexport_modules:
                 continue
             if any(
-                part in {"build", "dist", "__pycache__"} or part.endswith(".egg-info")
+                part in {"build", "dist", "__pycache__", ".venv", "venv"}
+                or part.endswith(".egg-info")
                 for part in path.parts
             ):
                 continue
