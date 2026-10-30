@@ -53,11 +53,12 @@ class FakeContext:
 
 class JobsTest(unittest.TestCase):
     def setUp(self):
-        self._saved = (jobs.client, jobs.HEARTBEAT_SECONDS)
+        self._saved = (jobs.client, jobs.HEARTBEAT_SECONDS, jobs.POLL_SECONDS)
         jobs.HEARTBEAT_SECONDS = 0.1
+        jobs.POLL_SECONDS = 0.02
 
     def tearDown(self):
-        jobs.client, jobs.HEARTBEAT_SECONDS = self._saved
+        jobs.client, jobs.HEARTBEAT_SECONDS, jobs.POLL_SECONDS = self._saved
 
     def test_long_job_sends_heartbeats_with_job_progress(self):
         jobs.client = FakeClient(run_seconds=0.5)
