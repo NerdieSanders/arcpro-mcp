@@ -14,7 +14,8 @@ namespace ArcGisMcpAddin.Commands
             string toolName,
             string[] parameters,
             bool allowDelete,
-            bool addOutputsToMap)
+            bool addOutputsToMap,
+            string? jobId = null)
         {
             if (IsDestructiveTool(toolName) && !DeletionAllowed(allowDelete))
             {
@@ -27,7 +28,20 @@ namespace ArcGisMcpAddin.Commands
             var valueArray = Geoprocessing.MakeValueArray(parameters);
             var flags = addOutputsToMap ? GPExecuteToolFlags.AddOutputsToMap : GPExecuteToolFlags.None;
 
-            IGPResult result = await Geoprocessing.ExecuteToolAsync(toolName, valueArray, null, null, null, flags);
+            var job = JobManager.Begin(jobId, $"run_gp_tool:{toolName}");
+            IGPResult result;
+            try
+            {
+                result = await Geoprocessing.ExecuteToolAsync(toolName, valueArray, null, job.Cts.Token, job.OnGpEvent, flags);
+            }
+            catch (OperationCanceledException)
+            {
+                return new { tool_name = toolName, job_id = job.Id, success = false, cancelled = true, messages = new List<string>(), outputs = new List<string>() };
+            }
+            finally
+            {
+                JobManager.End(job);
+            }
 
             var messages = new List<string>();
             if (result.Messages != null)
@@ -36,6 +50,11 @@ namespace ArcGisMcpAddin.Commands
                 {
                     messages.Add($"[{msg.Type}] {msg.Text}");
                 }
+            }
+
+            if (result.IsCanceled)
+            {
+                return new { tool_name = toolName, job_id = job.Id, success = false, cancelled = true, messages, outputs = new List<string>() };
             }
 
             if (result.IsFailed)
@@ -49,7 +68,9 @@ namespace ArcGisMcpAddin.Commands
             return new
             {
                 tool_name = toolName,
+                job_id = job.Id,
                 success = true,
+                cancelled = false,
                 messages = messages,
                 outputs = outputs,
                 return_value = result.ReturnValue,

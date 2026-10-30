@@ -13,6 +13,10 @@ DEFAULT_RETRIES = 2
 DEFAULT_RETRY_DELAY_MS = 250
 
 
+class RequestNotSentError(OSError):
+    """The request never reached ArcGIS Pro, so retrying it is safe."""
+
+
 class ArcGisPipeClient:
     def __init__(
         self,
@@ -86,6 +90,11 @@ class ArcGisPipeClient:
         """
         Sends a JSON-formatted command to the C# ArcGIS Pro Add-In,
         and waits for the response using length-prefixed framing.
+
+        timeout_ms bounds only the wait for a free pipe connection; the
+        response read has no limit, so long jobs are not cut off. Retries
+        happen only when the request was never written, so a command can
+        never run twice.
         """
         timeout = timeout_ms or self.timeout_ms
         attempts = self.retries if retries is None else retries
@@ -100,11 +109,15 @@ class ArcGisPipeClient:
                     "elapsed_ms", int((time.perf_counter() - started) * 1000)
                 )
                 return response
-            except (TimeoutError, OSError, pywintypes.error) as exc:
+            except (TimeoutError, RequestNotSentError) as exc:
                 last_error = exc
                 if attempt >= attempts:
                     break
                 time.sleep(self.retry_delay_ms / 1000)
+            except (OSError, pywintypes.error) as exc:
+                # The request may already be running in Pro. Never resend it.
+                last_error = exc
+                break
 
         return {
             "success": False,
@@ -127,7 +140,12 @@ class ArcGisPipeClient:
 
         handle = None
         try:
-            handle = self._connect(timeout_ms)
+            try:
+                handle = self._connect(timeout_ms)
+            except pywintypes.error as e:
+                raise RequestNotSentError(
+                    f"Could not open the ArcGIS Pro pipe: {e.strerror} (Code {e.winerror})"
+                ) from e
 
             # Send length prefix followed by the JSON payload
             win32file.WriteFile(handle, length_prefix)

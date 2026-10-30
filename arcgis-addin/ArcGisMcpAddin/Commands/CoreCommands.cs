@@ -11,8 +11,8 @@ namespace ArcGisMcpAddin.Commands
 {
     public static class CoreCommands
     {
-        public const string AddinVersion = "0.6.0";
-        public const string McpVersion = "0.6.0";
+        public const string AddinVersion = "0.7.0";
+        public const string McpVersion = "0.7.0";
 
         public static Task<object> HealthCheckAsync()
         {
@@ -55,25 +55,27 @@ namespace ArcGisMcpAddin.Commands
         public static readonly IReadOnlyList<string> All = new List<string>
         {
             "add_dynamic_text",
-            "add_layer_to_map",
             "add_layer_to_group",
+            "add_layer_to_map",
             "apply_graduated_symbology",
             "apply_raster_colorizer",
             "apply_symbology_from_layer",
             "apply_unique_value_symbology",
+            "cancel_job",
             "check_license",
             "clear_selection",
             "count_features",
             "create_basic_layout",
+            "create_bookmark",
             "create_domain",
             "create_feature",
             "create_group_layer",
             "create_map_series",
-            "create_bookmark",
             "delete_bookmark",
-            "delete_selected_features",
             "delete_features",
+            "delete_selected_features",
             "describe_dataset",
+            "execute_code",
             "export_active_map",
             "export_all_layouts",
             "export_layer",
@@ -92,6 +94,7 @@ namespace ArcGisMcpAddin.Commands
             "get_selected_features",
             "health_check",
             "insert_features",
+            "job_status",
             "label_layer",
             "list_bookmarks",
             "list_domains",
@@ -118,6 +121,7 @@ namespace ArcGisMcpAddin.Commands
             "set_layer_transparency",
             "set_map_extent",
             "stage_service_definition",
+            "status",
             "toggle_layer_visibility",
             "undo_last_edit",
             "update_attributes",
@@ -131,7 +135,7 @@ namespace ArcGisMcpAddin.Commands
     public static class ToolNames
     {
         public static readonly IReadOnlyList<string> All = CommandNames.All
-            .Where(command => !command.Equals("ping", StringComparison.OrdinalIgnoreCase))
+            .Where(command => command != "ping" && command != "job_status")
             .Concat(new[]
             {
                 // Python-only wrappers (delegate to run_gp_tool or to another

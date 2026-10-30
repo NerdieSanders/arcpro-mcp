@@ -1,40 +1,201 @@
+import json
+import os
+
 from mcp.server.fastmcp import Context, FastMCP
 
-from . import prompts, resources, tools
+from . import jobs, prompts, resources, tools
+from .tools.safety import DestructiveOperationBlocked, guard_destructive_tool
+
+INSTRUCTIONS = """\
+Controls the running ArcGIS Pro session.
+- Call status first: it shows whether Pro is up, the open project, maps,
+  layers, and any job still running.
+- Use execute_code for most work. It runs Python inside Pro, where
+  arcpy.mp.ArcGISProject("CURRENT") is the open project. Each call starts
+  with a fresh namespace, so define everything the code needs. print() output
+  is returned.
+- Use run_gp_tool for a single long geoprocessing tool: it reports percent
+  done and cancels cleanly.
+- One job runs at a time. Long jobs send progress while they run. Use
+  cancel_job to stop one.
+"""
 
 # Initialize FastMCP Server
-mcp = FastMCP("arcgis-mcp")
+mcp = FastMCP("arcpro-mcp", instructions=INSTRUCTIONS)
+
+# The default toolset is the small core below. ARCPRO_MCP_TOOLSET=full also
+# registers the upstream project's ~160 single-purpose tools.
+FULL_TOOLSET = os.environ.get("ARCPRO_MCP_TOOLSET", "core").strip().lower() == "full"
+
+
+def full_tool(*args, **kwargs):
+    """Registers a tool only when the full toolset is enabled."""
+    if FULL_TOOLSET:
+        return mcp.tool(*args, **kwargs)
+    return lambda fn: fn
+
+
+def _dump(value) -> str:
+    return json.dumps(value, indent=1, default=str)
+
+
+def _failure(resp: dict) -> str:
+    return _dump(
+        {
+            "ok": False,
+            "error_code": resp.get("error_code") or "UNKNOWN",
+            "error": resp.get("message") or resp.get("error"),
+        }
+    )
+
+
+# =====================================================================
+# CORE TOOLS (always registered)
+# =====================================================================
+
+
+@mcp.tool()
+async def status() -> str:
+    """Shows whether ArcGIS Pro and the add-in are reachable, the open project,
+    its maps, the active map's layers and tables, and any running job."""
+    resp = await jobs.send("status", timeout_ms=3000)
+    if resp.get("success"):
+        return _dump(resp.get("data"))
+    if resp.get("error_code") == "IPC_UNAVAILABLE":
+        return _dump(
+            {
+                "ok": False,
+                "error_code": "PRO_NOT_RUNNING",
+                "error": "ArcGIS Pro is not running, or the ArcPro MCP add-in is not "
+                "loaded. Open Pro with a project and try again.",
+                "detail": resp.get("message"),
+            }
+        )
+    return _failure(resp)
+
+
+@mcp.tool()
+async def execute_code(code: str, ctx: Context = None) -> str:
+    """Runs Python code inside ArcGIS Pro and returns what it printed.
+
+    arcpy is already imported. Use arcpy.mp.ArcGISProject("CURRENT") for the
+    open project. Each call gets a fresh namespace. Long runs report progress
+    (the last printed line) and can be stopped with cancel_job; cancellation
+    takes effect between Python statements, not inside one arcpy call.
+    """
+    resp = await jobs.run_job("execute_code", {"code": code}, ctx)
+    if not resp.get("success"):
+        return _failure(resp)
+    data = resp.get("data") or {}
+    keep = [
+        "job_id",
+        "ok",
+        "cancelled",
+        "error",
+        "traceback",
+        "stdout_truncated",
+        "stdout_path",
+        "code_elapsed_s",
+    ]
+    summary = {k: data.get(k) for k in keep if data.get(k) not in (None, False)}
+    summary["ok"] = bool(data.get("ok"))
+    summary["elapsed_s"] = round(resp.get("elapsed_ms", 0) / 1000, 1)
+    stdout = data.get("stdout") or ""
+    return _dump(summary) + ("\n--- stdout ---\n" + stdout if stdout else "")
+
+
+@mcp.tool()
+async def run_gp_tool(
+    tool_name: str,
+    parameters: list[str],
+    add_outputs_to_map: bool = False,
+    allow_delete: bool = False,
+    ctx: Context = None,
+) -> str:
+    """Runs one ArcGIS Pro geoprocessing tool with positional parameters.
+
+    Example: tool_name="analysis.Buffer", parameters=["Roads", "Roads_Buffer",
+    "100 Meters"]. Reports percent done while running and can be stopped with
+    cancel_job. Tools that delete or truncate need allow_delete=true.
+    """
+    try:
+        guard_destructive_tool(tool_name, allow_delete)
+    except DestructiveOperationBlocked as exc:
+        return _dump({"ok": False, "error_code": "BLOCKED", "error": str(exc)})
+
+    resp = await jobs.run_job(
+        "run_gp_tool",
+        {
+            "tool_name": tool_name,
+            "parameters": [str(p) for p in parameters],
+            "add_outputs_to_map": add_outputs_to_map,
+            "allow_delete": allow_delete,
+        },
+        ctx,
+    )
+    if not resp.get("success"):
+        return _failure(resp)
+    data = dict(resp.get("data") or {})
+    data["elapsed_s"] = round(resp.get("elapsed_ms", 0) / 1000, 1)
+    return _dump(data)
+
+
+@mcp.tool()
+async def get_layer_fields(layer_name: str) -> str:
+    """Lists a feature layer's fields: name, alias, and type."""
+    resp = await jobs.send("get_layer_fields", {"layer_name": layer_name}, 5000)
+    return _dump(resp.get("data")) if resp.get("success") else _failure(resp)
+
+
+@mcp.tool()
+async def save_project() -> str:
+    """Saves the open ArcGIS Pro project."""
+    resp = await jobs.send("save_project", timeout_ms=5000)
+    return _dump(resp.get("data")) if resp.get("success") else _failure(resp)
+
+
+@mcp.tool()
+async def cancel_job(job_id: str = "") -> str:
+    """Stops the running execute_code or run_gp_tool job. Leave job_id empty to
+    stop whatever is running."""
+    resp = await jobs.cancel(job_id or None)
+    return _dump(resp.get("data")) if resp.get("success") else _failure(resp)
+
+
+# =====================================================================
+# FULL TOOLSET (registered only with ARCPRO_MCP_TOOLSET=full)
+# =====================================================================
 
 # =====================================================================
 # 0. IPC CORE AND PROJECT TOOLS
 # =====================================================================
 
 
-@mcp.tool()
+@full_tool()
 def health_check(ctx: Context = None) -> str:
     """Checks MCP/Add-in/ArcGIS Pro pipe health and active project state."""
     return tools.health_check(ctx)
 
 
-@mcp.tool()
+@full_tool()
 def get_capabilities(ctx: Context = None) -> str:
     """Lists available Add-in command capabilities."""
     return tools.get_capabilities(ctx)
 
 
-@mcp.tool()
+@full_tool()
 def list_maps(ctx: Context = None) -> str:
     """Lists maps in the current ArcGIS Pro project."""
     return tools.list_maps(ctx)
 
 
-@mcp.tool()
+@full_tool()
 def open_map(map_name: str, ctx: Context = None) -> str:
     """Opens a map in ArcGIS Pro by name."""
     return tools.open_map(map_name, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def save_project_as(
     output_path: str, overwrite: bool = False, ctx: Context = None
 ) -> str:
@@ -42,13 +203,13 @@ def save_project_as(
     return tools.save_project_as(output_path, overwrite, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def list_project_items(ctx: Context = None) -> str:
     """Lists main project items in the current ArcGIS Pro project."""
     return tools.list_project_items(ctx)
 
 
-@mcp.tool()
+@full_tool()
 def list_bookmarks(map_name: str = "", ctx: Context = None) -> str:
     """Lists bookmarks for the active map or a named map."""
     return tools.list_bookmarks(map_name, ctx)
@@ -59,31 +220,31 @@ def list_bookmarks(map_name: str = "", ctx: Context = None) -> str:
 # =====================================================================
 
 
-@mcp.tool()
+@full_tool()
 def get_active_map(ctx: Context = None) -> str:
     """Returns the name of the active map and scene view in ArcGIS Pro."""
     return tools.get_active_map(ctx)
 
 
-@mcp.tool()
+@full_tool()
 def list_layers(include_hidden: bool = True, ctx: Context = None) -> str:
     """Lists all layers in the active map, showing names, types, visibility, and total features."""
     return tools.list_layers(include_hidden, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def zoom_to_layer(layer_name: str, ctx: Context = None) -> str:
     """Zooms the active map view to the spatial extent of a specific layer by name."""
     return tools.zoom_to_layer(layer_name, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def toggle_layer_visibility(layer_name: str, visible: bool, ctx: Context = None) -> str:
     """Toggles the visibility of a layer in the active map by name."""
     return tools.toggle_layer_visibility(layer_name, visible, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def set_map_extent(
     xmin: float,
     ymin: float,
@@ -96,13 +257,13 @@ def set_map_extent(
     return tools.set_map_extent(xmin, ymin, xmax, ymax, wkid, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def add_layer_to_map(data_path: str, layer_name: str = "", ctx: Context = None) -> str:
     """Adds a dataset, layer file, or service URL to the active map."""
     return tools.add_layer_to_map(data_path, layer_name, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def create_group_layer(
     group_name: str, layer_names: list | None = None, ctx: Context = None
 ) -> str:
@@ -110,13 +271,13 @@ def create_group_layer(
     return tools.create_group_layer(group_name, layer_names, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def add_layer_to_group(group_name: str, layer_names: list, ctx: Context = None) -> str:
     """Moves existing layers into an existing group layer in the active map."""
     return tools.add_layer_to_group(group_name, layer_names, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def set_layer_transparency(
     layer_name: str, transparency: float, ctx: Context = None
 ) -> str:
@@ -124,22 +285,16 @@ def set_layer_transparency(
     return tools.set_layer_transparency(layer_name, transparency, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def set_definition_query(layer_name: str, sql_filter: str, ctx: Context = None) -> str:
     """Sets or clears a definition query on a feature layer."""
     return tools.set_definition_query(layer_name, sql_filter, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def clear_selection(layer_name: str = "", ctx: Context = None) -> str:
     """Clears selection in one feature layer or in the whole active map."""
     return tools.clear_selection(layer_name, ctx)
-
-
-@mcp.tool()
-def save_project(ctx: Context = None) -> str:
-    """Saves the current ArcGIS Pro project."""
-    return tools.save_project(ctx)
 
 
 # =====================================================================
@@ -147,13 +302,13 @@ def save_project(ctx: Context = None) -> str:
 # =====================================================================
 
 
-@mcp.tool()
+@full_tool()
 def count_features(layer_name: str, sql_filter: str = "", ctx: Context = None) -> str:
     """Counts the number of features in a specified layer. Optional SQL filter (e.g. "POPULATION > 100000")."""
     return tools.count_features(layer_name, sql_filter, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def select_features(
     layer_name: str,
     sql_filter: str,
@@ -164,7 +319,7 @@ def select_features(
     return tools.select_features(layer_name, sql_filter, selection_combination, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def get_selected_features(
     layer_name: str, max_features: int = 100, ctx: Context = None
 ) -> str:
@@ -172,13 +327,7 @@ def get_selected_features(
     return tools.get_selected_features(layer_name, max_features, ctx)
 
 
-@mcp.tool()
-def get_layer_fields(layer_name: str, ctx: Context = None) -> str:
-    """Gets the schema/fields of a layer, listing names, aliases, and data types of all attributes."""
-    return tools.get_layer_fields(layer_name, ctx)
-
-
-@mcp.tool()
+@full_tool()
 def query_layer(
     layer_name: str,
     where_clause: str = "1=1",
@@ -198,7 +347,7 @@ def query_layer(
 # =====================================================================
 
 
-@mcp.tool()
+@full_tool()
 def apply_graduated_symbology(
     layer_name: str,
     field_name: str,
@@ -213,7 +362,7 @@ def apply_graduated_symbology(
     )
 
 
-@mcp.tool()
+@full_tool()
 def apply_unique_value_symbology(
     layer_name: str,
     field_name: str,
@@ -227,7 +376,7 @@ def apply_unique_value_symbology(
     )
 
 
-@mcp.tool()
+@full_tool()
 def apply_symbology_from_layer(
     target_layer: str, symbology_layer: str, ctx: Context = None
 ) -> str:
@@ -235,7 +384,7 @@ def apply_symbology_from_layer(
     return tools.apply_symbology_from_layer(target_layer, symbology_layer, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def set_layer_symbol(
     layer_name: str,
     r: int,
@@ -249,7 +398,7 @@ def set_layer_symbol(
     return tools.set_layer_symbol(layer_name, r, g, b, width, alpha, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def label_layer(
     layer_name: str,
     field_name: str,
@@ -265,13 +414,13 @@ def label_layer(
     )
 
 
-@mcp.tool()
+@full_tool()
 def get_layer_symbology(layer_name: str, ctx: Context = None) -> str:
     """Returns renderer metadata for a layer."""
     return tools.get_layer_symbology(layer_name, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def update_class_breaks(
     layer_name: str,
     field_name: str,
@@ -286,7 +435,7 @@ def update_class_breaks(
     )
 
 
-@mcp.tool()
+@full_tool()
 def apply_raster_colorizer(
     raster_layer: str,
     symbology_layer: str = "",
@@ -302,19 +451,19 @@ def apply_raster_colorizer(
 # =====================================================================
 
 
-@mcp.tool()
+@full_tool()
 def save_layer_file(layer_name: str, output_path: str, ctx: Context = None) -> str:
     """Saves an active-map layer to a .lyrx file."""
     return tools.save_layer_file(layer_name, output_path, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def load_layer_file(layer_file_path: str, ctx: Context = None) -> str:
     """Loads a .lyrx file into the active map."""
     return tools.load_layer_file(layer_file_path, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def export_layer(
     layer_name: str, output_path: str, where_clause: str = "", ctx: Context = None
 ) -> str:
@@ -322,13 +471,13 @@ def export_layer(
     return tools.export_layer(layer_name, output_path, where_clause, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def remove_layer(layer_name: str, ctx: Context = None) -> str:
     """Removes a layer from the active map."""
     return tools.remove_layer(layer_name, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def update_attributes(
     layer_name: str, object_id: int, attributes: dict, ctx: Context = None
 ) -> str:
@@ -336,7 +485,7 @@ def update_attributes(
     return tools.update_attributes(layer_name, object_id, attributes, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def create_feature(
     layer_name: str,
     x: float,
@@ -349,13 +498,13 @@ def create_feature(
     return tools.create_feature(layer_name, x, y, wkid, attributes or {}, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def delete_selected_features(layer_name: str, ctx: Context = None) -> str:
     """Deletes selected features from a feature layer."""
     return tools.delete_selected_features(layer_name, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def undo_last_edit(ctx: Context = None) -> str:
     """Undoes the last MCP edit operation."""
     return tools.undo_last_edit(ctx)
@@ -366,22 +515,7 @@ def undo_last_edit(ctx: Context = None) -> str:
 # =====================================================================
 
 
-@mcp.tool()
-def run_gp_tool(
-    tool_name: str,
-    parameters: list,
-    add_outputs_to_map: bool = False,
-    allow_delete: bool = False,
-    ctx: Context = None,
-) -> str:
-    """Executes any ArcGIS Pro geoprocessing tool by name with list of parameters.
-    Example: tool_name="Buffer_analysis", parameters=["Roads", "Roads_Buffer", "100 Meters"]"""
-    return tools.run_gp_tool(
-        tool_name, parameters, ctx, add_outputs_to_map, allow_delete
-    )
-
-
-@mcp.tool()
+@full_tool()
 def buffer_analysis(
     input_features: str,
     output_feature_class: str,
@@ -394,7 +528,7 @@ def buffer_analysis(
     )
 
 
-@mcp.tool()
+@full_tool()
 def clip_analysis(
     input_features: str,
     clip_features: str,
@@ -405,7 +539,7 @@ def clip_analysis(
     return tools.clip_analysis(input_features, clip_features, output_feature_class, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def spatial_join(
     target_features: str,
     join_features: str,
@@ -433,19 +567,19 @@ def spatial_join(
 # =====================================================================
 
 
-@mcp.tool()
+@full_tool()
 def list_feature_classes(workspace_path: str, ctx: Context = None) -> str:
     """Lists feature classes in a file geodatabase."""
     return tools.list_feature_classes(workspace_path, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def list_domains(workspace_path: str, ctx: Context = None) -> str:
     """Lists geodatabase domains."""
     return tools.list_domains(workspace_path, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def create_domain(
     workspace_path: str,
     domain_name: str,
@@ -460,7 +594,7 @@ def create_domain(
     )
 
 
-@mcp.tool()
+@full_tool()
 def describe_dataset(dataset_path: str, ctx: Context = None) -> str:
     """Describes an active-map layer or geodatabase dataset."""
     return tools.describe_dataset(dataset_path, ctx)
@@ -471,19 +605,19 @@ def describe_dataset(dataset_path: str, ctx: Context = None) -> str:
 # =====================================================================
 
 
-@mcp.tool()
+@full_tool()
 def connect_portal(portal_url: str, token: str = "", ctx: Context = None) -> str:
     """Sets the MCP REST portal URL and optional token."""
     return tools.connect_portal(portal_url, token, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def get_active_portal(ctx: Context = None) -> str:
     """Returns the active ArcGIS Pro portal and MCP REST portal."""
     return tools.get_active_portal(ctx)
 
 
-@mcp.tool()
+@full_tool()
 def search_portal_items(
     query: str,
     max_items: int = 10,
@@ -495,7 +629,7 @@ def search_portal_items(
     return tools.search_portal_items(query, max_items, portal_url, token, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def describe_portal_item(
     item_id: str, portal_url: str = "", token: str = "", ctx: Context = None
 ) -> str:
@@ -503,7 +637,7 @@ def describe_portal_item(
     return tools.describe_portal_item(item_id, portal_url, token, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def publish_web_layer(
     service_definition_path: str,
     server_connection: str = "My Hosted Services",
@@ -535,7 +669,7 @@ def publish_web_layer(
     )
 
 
-@mcp.tool()
+@full_tool()
 def stage_service_definition(
     service_draft_path: str,
     output_service_definition_path: str = "",
@@ -549,19 +683,19 @@ def stage_service_definition(
     )
 
 
-@mcp.tool()
+@full_tool()
 def get_service_layers(service_url: str, token: str = "", ctx: Context = None) -> str:
     """Lists layers and tables exposed by a REST service."""
     return tools.get_service_layers(service_url, token, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def get_layer_schema(layer_url: str, token: str = "", ctx: Context = None) -> str:
     """Returns schema metadata for a REST feature layer."""
     return tools.get_layer_schema(layer_url, token, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def query_feature_service(
     layer_url: str,
     where: str = "1=1",
@@ -576,7 +710,7 @@ def query_feature_service(
     )
 
 
-@mcp.tool()
+@full_tool()
 def export_service_geojson(
     layer_url: str,
     output_path: str,
@@ -597,13 +731,13 @@ def export_service_geojson(
 # =====================================================================
 
 
-@mcp.tool()
+@full_tool()
 def list_layouts(ctx: Context = None) -> str:
     """Lists all the layouts (print layouts/map layouts) defined in the current ArcGIS Pro project."""
     return tools.list_layouts(ctx)
 
 
-@mcp.tool()
+@full_tool()
 def export_layout(
     layout_name: str,
     output_path: str,
@@ -617,7 +751,7 @@ def export_layout(
     )
 
 
-@mcp.tool()
+@full_tool()
 def export_all_layouts(
     output_directory: str,
     format_type: str = "PDF",
@@ -631,7 +765,7 @@ def export_all_layouts(
     )
 
 
-@mcp.tool()
+@full_tool()
 def create_basic_layout(
     layout_name: str,
     title: str,
@@ -643,7 +777,7 @@ def create_basic_layout(
     return tools.create_basic_layout(layout_name, title, page_width, page_height, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def export_active_map(
     output_path: str,
     format_type: str = "PNG",
@@ -658,7 +792,7 @@ def export_active_map(
     )
 
 
-@mcp.tool()
+@full_tool()
 def create_map_series(
     layout_name: str,
     map_frame_name: str,
@@ -672,7 +806,7 @@ def create_map_series(
     )
 
 
-@mcp.tool()
+@full_tool()
 def export_map_series(
     layout_name: str,
     output_path: str,
@@ -686,7 +820,7 @@ def export_map_series(
     )
 
 
-@mcp.tool()
+@full_tool()
 def add_dynamic_text(
     layout_name: str,
     text: str,
@@ -703,7 +837,7 @@ def add_dynamic_text(
     )
 
 
-@mcp.tool()
+@full_tool()
 def update_layout_element(
     layout_name: str,
     element_name: str,
@@ -720,7 +854,7 @@ def update_layout_element(
 # =====================================================================
 
 
-@mcp.tool()
+@full_tool()
 def search_arcgis_docs(query: str, max_results: int = 10, ctx: Context = None) -> str:
     """Searches local SDK docs and returns official online documentation links."""
     return tools.search_arcgis_docs(query, max_results, ctx)
@@ -765,7 +899,7 @@ def generate_addin_button(button_action: str) -> str:
 # =====================================================================
 
 
-@mcp.tool()
+@full_tool()
 def excel_to_table(
     input_excel_file: str,
     output_table: str,
@@ -777,7 +911,7 @@ def excel_to_table(
     return tools.excel_to_table(input_excel_file, output_table, sheet, cell_range, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def table_to_excel(
     input_table: str,
     output_excel_file: str,
@@ -795,13 +929,13 @@ def table_to_excel(
     )
 
 
-@mcp.tool()
+@full_tool()
 def kml_to_layer(input_kml: str, output_folder: str, ctx: Context = None) -> str:
     """Converts a KML/KMZ file into a feature class and layer file in a file geodatabase."""
     return tools.kml_to_layer(input_kml, output_folder, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def layer_to_kml(
     layer: str, output_kmz: str, output_scale: int = 0, ctx: Context = None
 ) -> str:
@@ -809,7 +943,7 @@ def layer_to_kml(
     return tools.layer_to_kml(layer, output_kmz, output_scale, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def features_to_json(
     in_features: str,
     out_json_file: str,
@@ -823,7 +957,7 @@ def features_to_json(
     )
 
 
-@mcp.tool()
+@full_tool()
 def json_to_features(
     in_json_file: str,
     out_features: str,
@@ -834,7 +968,7 @@ def json_to_features(
     return tools.json_to_features(in_json_file, out_features, geometry_type, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def raster_to_polygon(
     in_raster: str,
     out_polygon_features: str,
@@ -848,7 +982,7 @@ def raster_to_polygon(
     )
 
 
-@mcp.tool()
+@full_tool()
 def polygon_to_raster(
     in_features: str,
     value_field: str,
@@ -870,7 +1004,7 @@ def polygon_to_raster(
     )
 
 
-@mcp.tool()
+@full_tool()
 def point_to_raster(
     in_features: str,
     value_field: str,
@@ -892,7 +1026,7 @@ def point_to_raster(
     )
 
 
-@mcp.tool()
+@full_tool()
 def export_features(
     in_features: str,
     out_features: str,
@@ -906,7 +1040,7 @@ def export_features(
     )
 
 
-@mcp.tool()
+@full_tool()
 def export_table(
     in_table: str,
     out_table: str,
@@ -920,7 +1054,7 @@ def export_table(
     )
 
 
-@mcp.tool()
+@full_tool()
 def feature_class_to_shapefile(
     input_features: list, output_folder: str, ctx: Context = None
 ) -> str:
@@ -928,7 +1062,7 @@ def feature_class_to_shapefile(
     return tools.feature_class_to_shapefile(input_features, output_folder, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def cad_to_geodatabase(
     input_cad: str,
     output_geodatabase: str,
@@ -942,7 +1076,7 @@ def cad_to_geodatabase(
     )
 
 
-@mcp.tool()
+@full_tool()
 def bim_to_geodatabase(
     input_bim: str,
     output_geodatabase: str,
@@ -961,7 +1095,7 @@ def bim_to_geodatabase(
 # =====================================================================
 
 
-@mcp.tool()
+@full_tool()
 def dissolve(
     in_features: str,
     out_feature_class: str,
@@ -983,7 +1117,7 @@ def dissolve(
     )
 
 
-@mcp.tool()
+@full_tool()
 def intersect(
     in_features: list,
     out_feature_class: str,
@@ -1003,7 +1137,7 @@ def intersect(
     )
 
 
-@mcp.tool()
+@full_tool()
 def union(
     in_features: list,
     out_feature_class: str,
@@ -1018,7 +1152,7 @@ def union(
     )
 
 
-@mcp.tool()
+@full_tool()
 def erase(
     in_features: str,
     erase_features: str,
@@ -1032,13 +1166,13 @@ def erase(
     )
 
 
-@mcp.tool()
+@full_tool()
 def merge(inputs: list, output: str, field_map: str = "", ctx: Context = None) -> str:
     """Combines multiple input datasets into a new output dataset."""
     return tools.merge(inputs, output, field_map, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def append(
     inputs: list,
     target: str,
@@ -1051,7 +1185,7 @@ def append(
     return tools.append(inputs, target, schema_type, field_map, subtype, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def near(
     in_features: str,
     near_features: str,
@@ -1067,7 +1201,7 @@ def near(
     )
 
 
-@mcp.tool()
+@full_tool()
 def generate_near_table(
     in_features: str,
     near_features: list,
@@ -1095,7 +1229,7 @@ def generate_near_table(
     )
 
 
-@mcp.tool()
+@full_tool()
 def select_layer_by_location(
     in_layer: str,
     overlap_type: str = "INTERSECT",
@@ -1117,7 +1251,7 @@ def select_layer_by_location(
     )
 
 
-@mcp.tool()
+@full_tool()
 def summary_statistics(
     in_table: str,
     out_table: str,
@@ -1131,7 +1265,7 @@ def summary_statistics(
     )
 
 
-@mcp.tool()
+@full_tool()
 def frequency(
     in_table: str,
     out_table: str,
@@ -1143,7 +1277,7 @@ def frequency(
     return tools.frequency(in_table, out_table, frequency_fields, summary_fields, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def multiple_ring_buffer(
     input_features: str,
     output_feature_class: str,
@@ -1167,7 +1301,7 @@ def multiple_ring_buffer(
     )
 
 
-@mcp.tool()
+@full_tool()
 def split(
     in_features: str,
     split_features: str,
@@ -1179,7 +1313,7 @@ def split(
     return tools.split(in_features, split_features, split_field, out_workspace, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def select(
     in_features: str,
     out_feature_class: str,
@@ -1190,7 +1324,7 @@ def select(
     return tools.select(in_features, out_feature_class, where_clause, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def table_select(
     in_table: str, out_table: str, where_clause: str = "", ctx: Context = None
 ) -> str:
@@ -1203,7 +1337,7 @@ def table_select(
 # =====================================================================
 
 
-@mcp.tool()
+@full_tool()
 def calculate_field(
     in_table: str,
     field: str,
@@ -1219,7 +1353,7 @@ def calculate_field(
     )
 
 
-@mcp.tool()
+@full_tool()
 def add_field(
     in_table: str,
     field_name: str,
@@ -1249,13 +1383,13 @@ def add_field(
     )
 
 
-@mcp.tool()
+@full_tool()
 def delete_field(in_table: str, fields, ctx: Context = None) -> str:
     """Deletes one or more fields from a table or feature class."""
     return tools.delete_field(in_table, fields, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def project(
     in_dataset: str,
     out_dataset: str,
@@ -1281,37 +1415,37 @@ def project(
     )
 
 
-@mcp.tool()
+@full_tool()
 def define_projection(in_dataset: str, coor_system: str, ctx: Context = None) -> str:
     """Defines the projection of a dataset without transforming its coordinates."""
     return tools.define_projection(in_dataset, coor_system, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def copy_features(in_features: str, out_feature_class: str, ctx: Context = None) -> str:
     """Copies features to a new feature class."""
     return tools.copy_features(in_features, out_feature_class, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def copy_rows(in_rows: str, out_table: str, ctx: Context = None) -> str:
     """Copies the rows of a table, table view or feature class to a new table."""
     return tools.copy_rows(in_rows, out_table, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def get_count(in_features: str, ctx: Context = None) -> str:
     """Returns the total number of rows for a feature class, table or layer."""
     return tools.get_count(in_features, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def delete(in_data: str, data_type: str = "", ctx: Context = None) -> str:
     """Permanently deletes a dataset."""
     return tools.delete(in_data, data_type, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def rename(
     in_data: str, out_data: str, data_type: str = "", ctx: Context = None
 ) -> str:
@@ -1319,7 +1453,7 @@ def rename(
     return tools.rename(in_data, out_data, data_type, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def create_feature_class(
     out_path: str,
     out_name: str,
@@ -1343,13 +1477,13 @@ def create_feature_class(
     )
 
 
-@mcp.tool()
+@full_tool()
 def create_table(out_path: str, out_name: str, ctx: Context = None) -> str:
     """Creates an empty table in a geodatabase or dBASE workspace."""
     return tools.create_table(out_path, out_name, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def repair_geometry(
     in_features: str, delete_null: bool = False, ctx: Context = None
 ) -> str:
@@ -1357,13 +1491,13 @@ def repair_geometry(
     return tools.repair_geometry(in_features, delete_null, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def check_geometry(in_features: list, out_table: str, ctx: Context = None) -> str:
     """Produces a report of geometry problems in a feature class."""
     return tools.check_geometry(in_features, out_table, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def find_identical(
     in_dataset: str,
     out_dataset: str,
@@ -1385,7 +1519,7 @@ def find_identical(
     )
 
 
-@mcp.tool()
+@full_tool()
 def make_feature_layer(
     in_features: str, out_layer: str, where_clause: str = "", ctx: Context = None
 ) -> str:
@@ -1393,7 +1527,7 @@ def make_feature_layer(
     return tools.make_feature_layer(in_features, out_layer, where_clause, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def make_table_view(
     in_table: str,
     out_view: str,
@@ -1405,7 +1539,7 @@ def make_table_view(
     return tools.make_table_view(in_table, out_view, where_clause, workspace, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def add_join(
     in_layer_or_view: str,
     in_field: str,
@@ -1420,19 +1554,19 @@ def add_join(
     )
 
 
-@mcp.tool()
+@full_tool()
 def remove_join(in_layer_or_view: str, join_name: str = "", ctx: Context = None) -> str:
     """Removes a join from a feature layer or table view."""
     return tools.remove_join(in_layer_or_view, join_name, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def create_file_gdb(out_folder_path: str, out_name: str, ctx: Context = None) -> str:
     """Creates a file geodatabase in the specified folder."""
     return tools.create_file_gdb(out_folder_path, out_name, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def add_subtypes(
     in_table: str,
     field: str,
@@ -1449,45 +1583,45 @@ def add_subtypes(
 # =====================================================================
 
 
-@mcp.tool()
+@full_tool()
 def insert_features(layer_name: str, features: list, ctx: Context = None) -> str:
     """Inserts multiple point features in a single edit operation (arcpy.da-style batch).
     features: list of {"x", "y", "wkid"=4326, "attributes"={...}}."""
     return tools.insert_features(layer_name, features, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def update_features(layer_name: str, updates: list, ctx: Context = None) -> str:
     """Updates multiple features by ObjectID in a single edit operation.
     updates: list of {"objectid", "attributes"={...}}."""
     return tools.update_features(layer_name, updates, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def delete_features(layer_name: str, object_ids: list, ctx: Context = None) -> str:
     """Deletes features identified by the given ObjectIDs."""
     return tools.delete_features(layer_name, object_ids, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def create_bookmark(name: str, ctx: Context = None) -> str:
     """Creates a spatial bookmark from the current active map view extent."""
     return tools.create_bookmark(name, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def zoom_to_bookmark(name: str, ctx: Context = None) -> str:
     """Zooms the active map to a named bookmark."""
     return tools.zoom_to_bookmark(name, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def delete_bookmark(name: str, ctx: Context = None) -> str:
     """Deletes a bookmark by name from the active map."""
     return tools.delete_bookmark(name, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def create_topology(
     in_dataset: str,
     out_name: str,
@@ -1498,7 +1632,7 @@ def create_topology(
     return tools.create_topology(in_dataset, out_name, cluster_tolerance, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def add_feature_class_to_topology(
     in_topology: str,
     in_feature_class: str,
@@ -1512,7 +1646,7 @@ def add_feature_class_to_topology(
     )
 
 
-@mcp.tool()
+@full_tool()
 def add_rule_to_topology(
     in_topology: str,
     rule_type: str,
@@ -1534,7 +1668,7 @@ def add_rule_to_topology(
     )
 
 
-@mcp.tool()
+@full_tool()
 def validate_topology(
     in_topology: str,
     in_area: str = "FULL_EXTENT",
@@ -1550,7 +1684,7 @@ def validate_topology(
 # =====================================================================
 
 
-@mcp.tool()
+@full_tool()
 def find_routes(
     input_stops: str,
     output_routes: str,
@@ -1562,7 +1696,7 @@ def find_routes(
     return tools.find_routes(input_stops, output_routes, route_shape, travel_mode, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def generate_service_areas(
     input_facilities: str,
     output_breaks: str,
@@ -1577,7 +1711,7 @@ def generate_service_areas(
     )
 
 
-@mcp.tool()
+@full_tool()
 def find_closest_facilities(
     incidents: str,
     facilities: str,
@@ -1597,7 +1731,7 @@ def find_closest_facilities(
     )
 
 
-@mcp.tool()
+@full_tool()
 def generate_od_cost_matrix(
     origins: str,
     destinations: str,
@@ -1622,7 +1756,7 @@ def generate_od_cost_matrix(
 # =====================================================================
 
 
-@mcp.tool()
+@full_tool()
 def slope(
     in_raster: str,
     out_raster: str,
@@ -1638,7 +1772,7 @@ def slope(
     )
 
 
-@mcp.tool()
+@full_tool()
 def aspect(
     in_raster: str, out_raster: str, method: str = "PLANAR", ctx: Context = None
 ) -> str:
@@ -1646,7 +1780,7 @@ def aspect(
     return tools.aspect(in_raster, out_raster, method, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def hillshade(
     in_raster: str,
     out_raster: str,
@@ -1663,7 +1797,7 @@ def hillshade(
     )
 
 
-@mcp.tool()
+@full_tool()
 def reclassify(
     in_raster: str,
     reclass_field: str,
@@ -1678,13 +1812,13 @@ def reclassify(
     )
 
 
-@mcp.tool()
+@full_tool()
 def raster_calculator(expression: str, output_raster: str, ctx: Context = None) -> str:
     """Builds and executes a Map Algebra expression (Raster Calculator). Requires Spatial Analyst extension."""
     return tools.raster_calculator(expression, output_raster, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def kernel_density(
     in_features: str,
     population_field: str,
@@ -1706,7 +1840,7 @@ def kernel_density(
     )
 
 
-@mcp.tool()
+@full_tool()
 def extract_by_mask(
     in_raster: str,
     in_mask_data: str,
@@ -1720,7 +1854,7 @@ def extract_by_mask(
     )
 
 
-@mcp.tool()
+@full_tool()
 def weighted_overlay(
     weighted_overlay_table: str,
     out_raster: str,
@@ -1738,7 +1872,7 @@ def weighted_overlay(
 # =====================================================================
 
 
-@mcp.tool()
+@full_tool()
 def hot_spot_analysis(
     input_features: str,
     input_field: str,
@@ -1762,7 +1896,7 @@ def hot_spot_analysis(
     )
 
 
-@mcp.tool()
+@full_tool()
 def cluster_and_outlier_analysis(
     input_features: str,
     input_field: str,
@@ -1786,7 +1920,7 @@ def cluster_and_outlier_analysis(
     )
 
 
-@mcp.tool()
+@full_tool()
 def optimized_hot_spot_analysis(
     input_features: str,
     output_features: str,
@@ -1799,7 +1933,7 @@ def optimized_hot_spot_analysis(
     )
 
 
-@mcp.tool()
+@full_tool()
 def emerging_hot_spot_analysis(
     in_cube: str,
     analysis_variable: str,
@@ -1819,7 +1953,7 @@ def emerging_hot_spot_analysis(
     )
 
 
-@mcp.tool()
+@full_tool()
 def geographically_weighted_regression(
     in_features: str,
     dependent_variable: str,
@@ -1841,7 +1975,7 @@ def geographically_weighted_regression(
     )
 
 
-@mcp.tool()
+@full_tool()
 def generalized_linear_regression(
     in_features: str,
     dependent_variable: str,
@@ -1861,7 +1995,7 @@ def generalized_linear_regression(
     )
 
 
-@mcp.tool()
+@full_tool()
 def spatial_autocorrelation(
     input_features: str,
     input_field: str,
@@ -1888,25 +2022,25 @@ def spatial_autocorrelation(
 # =====================================================================
 
 
-@mcp.tool()
+@full_tool()
 def measure_distance(layer_a: str, layer_b: str, ctx: Context = None) -> str:
     """Geodesic distance (meters) between the first selected feature of each layer."""
     return tools.measure_distance(layer_a, layer_b, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def geometry_contains(layer_a: str, layer_b: str, ctx: Context = None) -> str:
     """Returns True if the selected feature of layer_a contains that of layer_b."""
     return tools.geometry_contains(layer_a, layer_b, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def geometry_intersects(layer_a: str, layer_b: str, ctx: Context = None) -> str:
     """Returns True if the two selected geometries intersect."""
     return tools.geometry_intersects(layer_a, layer_b, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def geometry_within_distance(
     layer_a: str, layer_b: str, distance: float, ctx: Context = None
 ) -> str:
@@ -1914,19 +2048,19 @@ def geometry_within_distance(
     return tools.geometry_within_distance(layer_a, layer_b, distance, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def geometry_area(layer_name: str, ctx: Context = None) -> str:
     """Returns the area of the first selected polygon feature in the layer."""
     return tools.geometry_area(layer_name, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def geometry_length(layer_name: str, ctx: Context = None) -> str:
     """Returns the length of the first selected polyline feature in the layer."""
     return tools.geometry_length(layer_name, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def set_camera_3d(
     heading: float,
     pitch: float,
@@ -1943,7 +2077,7 @@ def set_camera_3d(
 # =====================================================================
 
 
-@mcp.tool()
+@full_tool()
 def package_map(
     in_map: str,
     output_file: str,
@@ -1965,7 +2099,7 @@ def package_map(
     )
 
 
-@mcp.tool()
+@full_tool()
 def package_project(
     in_project: str,
     output_file: str,
@@ -1979,7 +2113,7 @@ def package_project(
     )
 
 
-@mcp.tool()
+@full_tool()
 def package_layer(
     in_layer: str,
     output_file: str,
@@ -2001,7 +2135,7 @@ def package_layer(
     )
 
 
-@mcp.tool()
+@full_tool()
 def create_mobile_map_package(
     in_map: list,
     output_file: str,
@@ -2016,7 +2150,7 @@ def create_mobile_map_package(
     )
 
 
-@mcp.tool()
+@full_tool()
 def create_vector_tile_package(
     in_map: str,
     output_file: str,
@@ -2030,7 +2164,7 @@ def create_vector_tile_package(
     )
 
 
-@mcp.tool()
+@full_tool()
 def share_package(
     package_path: str, summary: str = "", tags: list | None = None, ctx: Context = None
 ) -> str:
@@ -2038,7 +2172,7 @@ def share_package(
     return tools.share_package(package_path, summary, tags, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def consolidate_project(
     in_project: str,
     output_folder: str,
@@ -2052,7 +2186,7 @@ def consolidate_project(
     )
 
 
-@mcp.tool()
+@full_tool()
 def replace_web_layer(
     in_sd_file: str,
     replace_layers: str = "REPLACE_ALL",
@@ -2063,7 +2197,7 @@ def replace_web_layer(
     return tools.replace_web_layer(in_sd_file, replace_layers, edit_properties, ctx)
 
 
-@mcp.tool()
+@full_tool()
 def geocode_addresses(
     in_table: str,
     address_fields: dict,
@@ -2083,7 +2217,7 @@ def geocode_addresses(
     )
 
 
-@mcp.tool()
+@full_tool()
 def reverse_geocode(
     in_features: str,
     in_address_locator: str,
@@ -2097,7 +2231,7 @@ def reverse_geocode(
     )
 
 
-@mcp.tool()
+@full_tool()
 def create_locator(
     reference_data: list,
     primary_table_info: dict,
@@ -2117,7 +2251,7 @@ def create_locator(
     )
 
 
-@mcp.tool()
+@full_tool()
 def rematch_addresses(
     in_geocoded_feature_class: str,
     in_address_locator: str,
@@ -2135,7 +2269,7 @@ def rematch_addresses(
 # =====================================================================
 
 
-@mcp.tool()
+@full_tool()
 def check_license(ctx: Context = None) -> str:
     """Returns the current ArcGIS Pro license level and the list of licensed extensions."""
     return tools.get_license_status(ctx)

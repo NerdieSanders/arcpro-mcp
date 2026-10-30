@@ -50,6 +50,9 @@ namespace ArcGisMcpAddin
 
         private async Task ListenLoopAsync(CancellationToken token)
         {
+            // Each accepted connection is served on its own task, and a new
+            // listening instance is created right away. A long job therefore
+            // never blocks status, job_status or cancel_job.
             while (!token.IsCancellationRequested)
             {
                 NamedPipeServerStream? pipeServer = null;
@@ -58,52 +61,73 @@ namespace ArcGisMcpAddin
                     pipeServer = new NamedPipeServerStream(
                         PipeName,
                         PipeDirection.InOut,
-                        1,
+                        NamedPipeServerStream.MaxAllowedServerInstances,
                         PipeTransmissionMode.Byte,
                         PipeOptions.Asynchronous
                     );
 
                     await pipeServer.WaitForConnectionAsync(token);
 
-                    if (token.IsCancellationRequested) break;
+                    if (token.IsCancellationRequested)
+                    {
+                        pipeServer.Dispose();
+                        break;
+                    }
 
-                    await ProcessClientRequestAsync(pipeServer, token);
+                    var connection = pipeServer;
+                    pipeServer = null;
+                    _ = Task.Run(() => ServeConnectionAsync(connection, token), token);
                 }
                 catch (OperationCanceledException)
                 {
+                    pipeServer?.Dispose();
                     break;
                 }
                 catch (Exception ex)
                 {
                     System.Diagnostics.Debug.WriteLine($"Pipe server connection error: {ex.Message}");
+                    pipeServer?.Dispose();
                     await Task.Delay(500, token);
-                }
-                finally
-                {
-                    if (pipeServer != null)
-                    {
-                        try
-                        {
-                            if (pipeServer.IsConnected)
-                            {
-                                pipeServer.Disconnect();
-                            }
-                        }
-                        catch (IOException ex)
-                        {
-                            System.Diagnostics.Debug.WriteLine($"Pipe disconnect error: {ex.Message}");
-                        }
-                        catch (InvalidOperationException ex)
-                        {
-                            System.Diagnostics.Debug.WriteLine($"Pipe disconnect skipped: {ex.Message}");
-                        }
-                        pipeServer.Dispose();
-                    }
                 }
             }
         }
 
-        private async Task ProcessClientRequestAsync(NamedPipeServerStream pipeStream, CancellationToken token)
+        private static async Task ServeConnectionAsync(NamedPipeServerStream pipeServer, CancellationToken token)
+        {
+            try
+            {
+                await ProcessClientRequestAsync(pipeServer, token);
+            }
+            catch (OperationCanceledException)
+            {
+                System.Diagnostics.Debug.WriteLine("Pipe request cancelled during shutdown.");
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Pipe request error: {ex.Message}");
+            }
+            finally
+            {
+                try
+                {
+                    if (pipeServer.IsConnected)
+                    {
+                        pipeServer.Disconnect();
+                    }
+                }
+                catch (IOException ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"Pipe disconnect error: {ex.Message}");
+                }
+                catch (InvalidOperationException ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"Pipe disconnect skipped: {ex.Message}");
+                }
+                pipeServer.Dispose();
+            }
+        }
+
+        private static async Task ProcessClientRequestAsync(NamedPipeServerStream pipeStream, CancellationToken token)
         {
             byte[] lengthBytes = await ReadExactlyAsync(pipeStream, sizeof(int), token);
             int requestLength = BitConverter.ToInt32(lengthBytes, 0);
