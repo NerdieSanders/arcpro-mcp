@@ -13,7 +13,7 @@
     <!-- autoLoad starts the local pipe server when ArcGIS Pro loads the Add-In. -->
     <insertModule id="ArcGisMcpAddin_Module" className="Module1" autoLoad="true" caption="ArcGIS MCP Module">
       <tabs>
-        <tab id="ArcGisMcpAddin_Tab" caption="ArcPro">
+        <tab id="ArcGisMcpAddin_Tab" caption="MCP">
           <group refID="ArcGisMcpAddin_Group" />
         </tab>
       </tabs>
