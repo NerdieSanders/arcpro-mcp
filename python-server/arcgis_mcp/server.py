@@ -29,9 +29,17 @@ mcp = FastMCP("arcpro-mcp", instructions=INSTRUCTIONS)
 FULL_TOOLSET = os.environ.get("ARCPRO_MCP_TOOLSET", "core").strip().lower() == "full"
 
 
+# Every tool returns its own text, often pre-formatted JSON. Without
+# structured_output=False, FastMCP infers a schema from the `-> str` annotation
+# and also sends the text as structuredContent {"result": "<string>"}. Clients
+# that render structuredContent then show the text re-escaped: literal \n,
+# \" and doubled backslashes. Plain text content shows as written.
+
+
 def full_tool(*args, **kwargs):
     """Registers a tool only when the full toolset is enabled."""
     if FULL_TOOLSET:
+        kwargs.setdefault("structured_output", False)
         return mcp.tool(*args, **kwargs)
     return lambda fn: fn
 
@@ -84,7 +92,7 @@ def _format_job(command: str, resp: dict) -> str:
 # =====================================================================
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 async def status() -> str:
     """Shows whether ArcGIS Pro and the add-in are reachable, the open project,
     its maps, the active map's layers and tables, and any running job."""
@@ -104,7 +112,7 @@ async def status() -> str:
     return _failure(resp)
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 async def execute_code(code: str, ctx: Context = None) -> str:
     """Runs Python code inside ArcGIS Pro and returns what it printed.
 
@@ -117,7 +125,7 @@ async def execute_code(code: str, ctx: Context = None) -> str:
     return _format_job("execute_code", resp)
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 async def run_gp_tool(
     tool_name: str,
     parameters: list[str],
@@ -149,7 +157,7 @@ async def run_gp_tool(
     return _format_job("run_gp_tool", resp)
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 async def job_result(job_id: str, ctx: Context = None) -> str:
     """Waits for a job that execute_code or run_gp_tool returned as still
     running, and returns its result. Only needed where the client limits how
@@ -159,21 +167,21 @@ async def job_result(job_id: str, ctx: Context = None) -> str:
     return _format_job(command or "", resp)
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 async def get_layer_fields(layer_name: str) -> str:
     """Lists a feature layer's fields: name, alias, and type."""
     resp = await jobs.send("get_layer_fields", {"layer_name": layer_name}, 5000)
     return _dump(resp.get("data")) if resp.get("success") else _failure(resp)
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 async def save_project() -> str:
     """Saves the open ArcGIS Pro project."""
     resp = await jobs.send("save_project", timeout_ms=5000)
     return _dump(resp.get("data")) if resp.get("success") else _failure(resp)
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 async def cancel_job(job_id: str = "") -> str:
     """Stops the running execute_code or run_gp_tool job. Leave job_id empty to
     stop whatever is running."""
